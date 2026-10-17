@@ -3,7 +3,10 @@ mod tests {
     use credit_oracle::{CreditOracle, CreditOracleClient, TxStats};
     use identity_oracle::{IdentityOracle, IdentityOracleClient};
     use revocation_registry::{RevocationRegistry, RevocationRegistryClient};
-    use soroban_sdk::{testutils::Address as _, BytesN, Env, String};
+    use soroban_sdk::{
+        testutils::{Address as _, Ledger as _},
+        BytesN, Env, String,
+    };
 
     #[test]
     fn test_full_protocol_flow() {
@@ -271,5 +274,70 @@ mod tests {
             score_with_2_vcs,
             score_with_5_vcs
         );
+    }
+
+    #[test]
+    fn test_recency_decay_affects_score() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let identity_id = env.register_contract(None, IdentityOracle);
+        let credit_id = env.register_contract(None, CreditOracle);
+        let identity = IdentityOracleClient::new(&env, &identity_id);
+        let credit = CreditOracleClient::new(&env, &credit_id);
+
+        let admin = soroban_sdk::Address::generate(&env);
+        identity.initialize(&admin);
+        credit.initialize(&admin);
+        credit.set_identity_oracle(&admin, &identity_id);
+
+        let issuer = soroban_sdk::Address::generate(&env);
+        identity.register_issuer(&admin, &issuer);
+        let subject = soroban_sdk::Address::generate(&env);
+        identity.anchor_did(&subject, &String::from_str(&env, "ipfs://QmRecency"));
+
+        let t0 = 1_700_000_000u64;
+        let day = 86_400u64;
+        env.ledger().set_timestamp(t0);
+        for i in 0..5u8 {
+            identity.anchor_vc(&issuer, &subject, &BytesN::from_array(&env, &[i; 32]));
+        }
+
+        let feeder = soroban_sdk::Address::generate(&env);
+        credit.register_feeder(&admin, &feeder);
+        credit.set_vc_count(&feeder, &subject, &5);
+
+        let weights = credit.get_scoring_weights();
+        let manual_score = |vc_points: u32| -> u32 {
+            let composite = vc_points * weights.vc_weight / 100;
+            (300 + composite * 550 / 100).clamp(300, 850)
+        };
+
+        let baseline = credit.compute_score(&subject);
+        assert_eq!(baseline, manual_score(100));
+        assert_eq!(baseline, 520);
+
+        credit.set_recency_decay(&admin, &true, &5, &5_000);
+
+        env.ledger().set_timestamp(t0 + 100 * day);
+        env.ledger()
+            .set_sequence_number(env.ledger().sequence() + 1);
+        let aged_100d = credit.compute_score(&subject);
+        assert_eq!(aged_100d, manual_score(95));
+        assert_eq!(aged_100d, 509);
+        assert!(aged_100d < baseline);
+
+        env.ledger().set_timestamp(t0 + 1_825 * day);
+        env.ledger()
+            .set_sequence_number(env.ledger().sequence() + 1);
+        let aged_5y = credit.compute_score(&subject);
+        assert_eq!(aged_5y, manual_score(50));
+        assert_eq!(aged_5y, 410);
+        assert!(aged_5y < aged_100d);
+
+        credit.set_recency_decay(&admin, &false, &5, &5_000);
+        env.ledger()
+            .set_sequence_number(env.ledger().sequence() + 1);
+        assert_eq!(credit.compute_score(&subject), baseline);
     }
 }

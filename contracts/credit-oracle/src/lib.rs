@@ -1,8 +1,15 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, contracterror, symbol_short, Address, BytesN, Env};
+use soroban_sdk::{
+    contract, contractclient, contracterror, contractimpl, contracttype, symbol_short, Address,
+    BytesN, Env, Vec,
+};
 
 pub const MIN_SCORE: u32 = 300;
 pub const MAX_SCORE: u32 = 850;
+pub const SECONDS_PER_DAY: u64 = 86_400;
+const BPS_DENOMINATOR: u32 = 10_000;
+const DEFAULT_DECAY_BPS_PER_DAY: u32 = 5;
+const DEFAULT_MIN_RECENCY_BPS: u32 = 5_000;
 
 /// Error types for the credit-oracle contract.
 #[contracterror]
@@ -18,6 +25,8 @@ pub enum CreditOracleError {
     LenderNotRegistered = 4,
     /// Proposed weights do not sum to 100.
     InvalidWeights = 5,
+    /// Minimum recency multiplier must not exceed 10,000 basis points.
+    InvalidRecencyConfig = 6,
 }
 
 /// Storage keys for the credit oracle contract
@@ -43,6 +52,14 @@ pub enum DataKey {
     PendingWeights,
     /// Ledger number when pending weights become effective
     PendingWeightsEffectiveLedger,
+    /// Configured identity-oracle contract ID
+    IdentityOracleId,
+    /// Whether per-VC recency decay is enabled
+    RecencyDecayEnabled,
+    /// Recency multiplier reduction in basis points per day
+    DecayBpsPerDay,
+    /// Minimum per-VC recency multiplier in basis points
+    MinRecencyBps,
 }
 
 /// Credit score record with metadata
@@ -103,6 +120,49 @@ pub struct RepaymentRecord {
     pub total_count: u32,
 }
 
+/// Recency decay configuration, defaulting to disabled for existing deployments.
+#[contracttype]
+#[derive(Clone)]
+pub struct RecencyDecayConfig {
+    pub enabled: bool,
+    pub decay_bps_per_day: u32,
+    pub min_recency_bps: u32,
+}
+
+/// Identity-oracle VC record shape used by the cross-contract client.
+#[contracttype]
+#[derive(Clone)]
+pub struct IdentityVCRecord {
+    pub vc_hash: BytesN<32>,
+    pub issuer: Address,
+    pub anchored_at: u64,
+    pub revoked: bool,
+}
+
+#[contractclient(name = "IdentityOracleClient")]
+pub trait IdentityOracleInterface {
+    fn get_vc_details(env: Env, subject: Address) -> Vec<IdentityVCRecord>;
+}
+
+/// Returns a VC recency multiplier in basis points, with whole-day decay.
+pub fn recency_multiplier_bps(
+    anchored_at: u64,
+    now: u64,
+    decay_bps_per_day: u32,
+    min_recency_bps: u32,
+) -> u32 {
+    let age_days = now.saturating_sub(anchored_at) / SECONDS_PER_DAY;
+    let decay = age_days.saturating_mul(decay_bps_per_day as u64);
+    BPS_DENOMINATOR
+        .saturating_sub(decay.min(BPS_DENOMINATOR as u64) as u32)
+        .max(min_recency_bps.min(BPS_DENOMINATOR))
+}
+
+/// Applies a basis-point multiplier to VC points without overflowing.
+pub fn apply_recency_bps(points: u32, recency_bps: u32) -> u32 {
+    ((points as u64 * recency_bps.min(BPS_DENOMINATOR) as u64) / BPS_DENOMINATOR as u64) as u32
+}
+
 const TIMELOCK_LEDGERS: u32 = 17_280; // approximately 24 hours
 
 #[contract]
@@ -126,6 +186,85 @@ impl CreditOracle {
         };
         env.storage().instance().set(&DataKey::Config, &default_weights);
         Ok(())
+    }
+
+    /// Configure the identity-oracle used for live VC timestamps.
+    pub fn set_identity_oracle(
+        env: Env,
+        admin: Address,
+        identity_oracle_id: Address,
+    ) -> Result<(), CreditOracleError> {
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("not initialized");
+        if admin != stored_admin {
+            return Err(CreditOracleError::NotAuthorized);
+        }
+        admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::IdentityOracleId, &identity_oracle_id);
+        Ok(())
+    }
+
+    /// Returns the configured identity-oracle contract ID, if any.
+    pub fn get_identity_oracle(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::IdentityOracleId)
+    }
+
+    /// Set the opt-in VC recency decay parameters.
+    pub fn set_recency_decay(
+        env: Env,
+        admin: Address,
+        enabled: bool,
+        decay_bps_per_day: u32,
+        min_recency_bps: u32,
+    ) -> Result<(), CreditOracleError> {
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("not initialized");
+        if admin != stored_admin {
+            return Err(CreditOracleError::NotAuthorized);
+        }
+        admin.require_auth();
+        if min_recency_bps > BPS_DENOMINATOR {
+            return Err(CreditOracleError::InvalidRecencyConfig);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::RecencyDecayEnabled, &enabled);
+        env.storage()
+            .instance()
+            .set(&DataKey::DecayBpsPerDay, &decay_bps_per_day);
+        env.storage()
+            .instance()
+            .set(&DataKey::MinRecencyBps, &min_recency_bps);
+        Ok(())
+    }
+
+    /// Returns the decay configuration, including backward-compatible defaults.
+    pub fn get_recency_decay(env: Env) -> RecencyDecayConfig {
+        RecencyDecayConfig {
+            enabled: env
+                .storage()
+                .instance()
+                .get(&DataKey::RecencyDecayEnabled)
+                .unwrap_or(false),
+            decay_bps_per_day: env
+                .storage()
+                .instance()
+                .get(&DataKey::DecayBpsPerDay)
+                .unwrap_or(DEFAULT_DECAY_BPS_PER_DAY),
+            min_recency_bps: env
+                .storage()
+                .instance()
+                .get(&DataKey::MinRecencyBps)
+                .unwrap_or(DEFAULT_MIN_RECENCY_BPS),
+        }
     }
 
     /// Register a trusted feeder address
@@ -227,7 +366,28 @@ impl CreditOracle {
             .get(&DataKey::VcCount(subject.clone()))
             .unwrap_or(0u32);
 
-        let vc_score = (vc_count * 20).min(100);
+        let recency = Self::get_recency_decay(env.clone());
+        let mut vc_score = (vc_count * 20).min(100);
+        if recency.enabled {
+            if let Some(identity_oracle_id) = Self::get_identity_oracle(env.clone()) {
+                let identity = IdentityOracleClient::new(&env, &identity_oracle_id);
+                let anchored_vcs = identity.get_vc_details(&subject);
+                let now = env.ledger().timestamp();
+                let mut points = 0u32;
+                for record in anchored_vcs.iter() {
+                    if !record.revoked {
+                        let multiplier = recency_multiplier_bps(
+                            record.anchored_at,
+                            now,
+                            recency.decay_bps_per_day,
+                            recency.min_recency_bps,
+                        );
+                        points = points.saturating_add(apply_recency_bps(20, multiplier));
+                    }
+                }
+                vc_score = points.min(100);
+            }
+        }
         let tx_score = ((tx_stats.volume_30d / 100_000_000i128) as u32).min(100);
         let repay_score = (repayment.on_time_count * 10000)
             .checked_div(repayment.total_count)
@@ -632,4 +792,3 @@ mod tests {
         client.upgrade(&non_admin, &BytesN::from_array(&env, &[0u8; 32]));
     }
 }
-

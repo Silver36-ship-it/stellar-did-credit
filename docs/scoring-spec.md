@@ -60,6 +60,28 @@ score = clamp(MIN_SCORE + composite × 550 ÷ 100, MIN_SCORE, MAX_SCORE)
 
 The 550-point spread means a perfect composite of 100 yields `MIN_SCORE` + 550 = `MAX_SCORE`.
 
+### Optional VC recency decay
+
+By default, VC recency decay is disabled and scoring uses the feeder's cached
+`vc_count`, preserving the existing formula. An administrator can enable decay
+with `set_recency_decay`; when an identity-oracle is configured with
+`set_identity_oracle`, the credit-oracle reads each active VC's `anchored_at`
+timestamp and applies this multiplier to its 20 VC points:
+
+```
+recency_multiplier_bps = max(
+    min_recency_bps,
+    10_000 - age_days × decay_bps_per_day
+)
+vc_points = 20 × recency_multiplier_bps ÷ 10_000
+```
+
+Age is measured in whole 86,400-second days, and multipliers are clamped at
+the configured floor. The default parameters are 5 basis points of decay per
+day and a 5,000-basis-point (50%) floor. A minimum above 10,000 basis points
+is rejected. If decay is enabled without configuring an identity-oracle, the
+contract continues to use the cached VC count without applying decay.
+
 ---
 
 ## Worked examples

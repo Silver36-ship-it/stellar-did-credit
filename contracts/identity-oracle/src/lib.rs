@@ -234,6 +234,14 @@ impl IdentityOracle {
         count
     }
 
+    /// Returns all anchored VC records for `subject`, including revoked entries.
+    pub fn get_vc_details(env: Env, subject: Address) -> Vec<VCRecord> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::VCAnchors(subject))
+            .unwrap_or(Vec::new(&env))
+    }
+
     /// Backwards-compatible wrapper.
     ///
     /// NOTE: This includes revoked entries. Prefer `get_active_vc_count` for scoring/verification.
