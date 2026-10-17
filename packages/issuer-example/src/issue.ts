@@ -1,0 +1,205 @@
+/**
+ * Minimal issuer script for the stellar-did-credit protocol.
+ *
+ * Usage:
+ *   ISSUER_SECRET=YOUR_STELLAR_SECRET_KEY npm run issue -- --subject GSUBJECT... --kyc-level basic --country NG
+ *   ISSUER_SECRET=YOUR_STELLAR_SECRET_KEY npm run issue -- --subject GSUBJECT... --revoke
+ *
+ * Required environment variables:
+ *   ISSUER_SECRET        — Stellar secret key of a registered issuer (starts with S)
+ *   IDENTITY_ORACLE_ID   — Contract address of the identity-oracle
+ *   CREDIT_ORACLE_ID     — Contract address of the credit-oracle
+ *   REVOCATION_REG_ID    — Contract address of the revocation-registry
+ *
+ * Optional environment variables:
+ *   NETWORK_PASSPHRASE   — Defaults to Stellar testnet passphrase
+ *   RPC_URL              — Defaults to the public Soroban testnet RPC
+ *   SIM_ACCOUNT          — Any funded testnet account used as fee source for read-only sims
+ */
+
+import { Keypair } from "@stellar/stellar-sdk";
+import canonicalize from "canonicalize";
+import { StellarDIDCreditSDK } from "@stellar-did-credit/sdk";
+import { buildKycCredential, hashVC } from "./hash";
+
+// ---------------------------------------------------------------------------
+// CLI argument parsing
+// ---------------------------------------------------------------------------
+
+function parseArgs(argv: string[]): Record<string, string> {
+  const args: Record<string, string> = {};
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg.startsWith("--")) {
+      const key = arg.slice(2);
+      if (key === "revoke") {
+        args[key] = "true";
+        continue;
+      }
+      const value = argv[i + 1] ?? "";
+      args[key] = value;
+      i++;
+    }
+  }
+  return args;
+}
+
+const args = parseArgs(process.argv.slice(2));
+
+let subjectAddress = args["subject"];
+const kycLevel = args["kyc-level"] ?? "basic";
+const country = args["country"] ?? "XX";
+const revokeAfterIssue = args["revoke"] === "true";
+/** Stable defaults from docs/issuer-guide.md — same inputs always yield the same hash. */
+const issuanceDate = args["issuance-date"] ?? "2026-06-28T12:00:00Z";
+const verifiedAt = args["verified-at"] ?? "2026-06-28T10:00:00Z";
+
+if (!subjectAddress) {
+  console.error("Error: --subject <G... or C...> is required");
+  process.exit(1);
+}
+
+// Validate Stellar address format and normalize to uppercase.
+// Accept both G- (account) and C- (contract) addresses: 56 base32 chars.
+const subjectAddressUpper = subjectAddress.toUpperCase();
+const stellarAddressRegex = /^[GC][A-Z2-7]{55}$/;
+if (!stellarAddressRegex.test(subjectAddressUpper)) {
+  console.error(
+    "Error: --subject must be a valid Stellar address (G... or C..., 56 base32 characters)"
+  );
+  process.exit(1);
+}
+
+subjectAddress = subjectAddressUpper;
+
+// ---------------------------------------------------------------------------
+// Environment configuration
+// ---------------------------------------------------------------------------
+
+function requireEnv(name: string): string {
+  const value = process.env[name];
+  if (!value) {
+    console.error(`Error: environment variable ${name} is not set`);
+    process.exit(1);
+  }
+  return value;
+}
+
+const issuerSecret = requireEnv("ISSUER_SECRET");
+const identityOracleId = requireEnv("IDENTITY_ORACLE_ID");
+const creditOracleId = requireEnv("CREDIT_ORACLE_ID");
+const revocationRegId = requireEnv("REVOCATION_REG_ID");
+const networkPassphrase =
+  process.env["NETWORK_PASSPHRASE"] ?? "Test SDF Network ; September 2015";
+const rpcUrl =
+  process.env["RPC_URL"] ?? "https://soroban-testnet.stellar.org";
+const simAccount =
+  process.env["SIM_ACCOUNT"] ??
+  "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+
+// ---------------------------------------------------------------------------
+// Build the Verifiable Credential JSON-LD document
+// ---------------------------------------------------------------------------
+
+const issuerKeypair = Keypair.fromSecret(issuerSecret);
+const issuerAddress = issuerKeypair.publicKey();
+const issuerDid = `did:stellar:testnet:${issuerAddress}`;
+const subjectDid = `did:stellar:testnet:${subjectAddress}`;
+
+const vc = buildKycCredential({
+  issuerDid,
+  subjectDid,
+  kycLevel,
+  country,
+  issuanceDate,
+  verifiedAt,
+});
+
+console.log("\nVerifiable Credential:");
+console.log(JSON.stringify(vc, null, 2));
+
+// ---------------------------------------------------------------------------
+// Canonicalize (RFC 8785 JCS) and SHA-256 hash the credential
+// ---------------------------------------------------------------------------
+
+const canonical = canonicalize(vc);
+if (!canonical) {
+  throw new Error("canonicalize() returned undefined — check your VC object");
+}
+
+console.log("\nCanonical form:");
+console.log(canonical);
+
+const vcHash = hashVC(vc);
+
+console.log("\nSHA-256 hash (hex):", vcHash.toString("hex"));
+
+// ---------------------------------------------------------------------------
+// Anchor the hash on-chain via the SDK
+// ---------------------------------------------------------------------------
+
+async function main(): Promise<void> {
+  const sdk = new StellarDIDCreditSDK({
+    identityOracleId,
+    creditOracleId,
+    revocationRegistryId: revocationRegId,
+    networkPassphrase,
+    rpcUrl,
+    simAccount,
+  });
+
+  const alreadyAnchored = await sdk.verifyVC(subjectAddress, vcHash);
+  if (alreadyAnchored) {
+    console.log("\nVC already anchored, skipping.");
+    return;
+  }
+
+  console.log("\nAnchoring credential hash on-chain...");
+  console.log("  Issuer :", issuerAddress);
+  console.log("  Subject:", subjectAddress);
+
+  const issueTxHash = await sdk.issueVC(
+    issuerKeypair,
+    subjectAddress,
+    vcHash
+  );
+
+  console.log("\nSuccess!");
+  console.log("  Transaction hash:", issueTxHash);
+  console.log(
+    "  View on explorer:",
+    `https://stellar.expert/explorer/testnet/tx/${issueTxHash}`
+  );
+
+  // Verify the anchor is readable
+  const confirmed = await sdk.verifyVC(subjectAddress, vcHash);
+  console.log("  Verified on-chain:", confirmed);
+
+  let revocationTxHash: string | undefined;
+  if (revokeAfterIssue) {
+    console.log("\nRevoking credential hash on-chain...");
+    revocationTxHash = await sdk.revokeVC(issuerKeypair, vcHash);
+    console.log("  Revocation transaction hash:", revocationTxHash);
+    console.log(
+      "  View on explorer:",
+      `https://stellar.expert/explorer/testnet/tx/${revocationTxHash}`
+    );
+  }
+
+  // Print the off-chain VC and its hash — the issuer should store both
+  console.log("\n--- Store this record off-chain ---");
+  console.log({
+    vcHash: vcHash.toString("hex"),
+    issueTxHash,
+    revocationTxHash,
+    subject: subjectAddress,
+    issuer: issuerAddress,
+    anchoredAt: issuanceDate,
+    vc,
+  });
+}
+
+main().catch((err) => {
+  console.error("\nFailed:", err instanceof Error ? err.message : err);
+  process.exit(1);
+});

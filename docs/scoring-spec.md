@@ -1,214 +1,134 @@
-# Scoring Specification
+# Scoring Specification & Freshness Enforcement
 
-The credit-oracle contract computes a score in the range **`MIN_SCORE` (300)–`MAX_SCORE` (850)**, matching the conventional credit score scale. The formula is deterministic, fully on-chain, and uses only data that has been explicitly submitted by trusted parties (feeders and lenders).
+## Scoring Formula
 
----
+The `credit-oracle` computes a credit score (300–850) for any subject from three
+weighted components: verified credentials (identity strength), on-chain
+transaction activity (breadth of financial behavior), and repayment history
+(reliability). The exact formula below mirrors `compute_score_pure` in
+`contracts/credit-oracle/src/lib.rs`.
 
-## Inputs
+### Components
 
-| Input                           | Source                        | Storage key                   |
-| ------------------------------- | ----------------------------- | ----------------------------- |
-| `vc_count`                      | Feeder via `set_vc_count`     | `VcCount(subject)`            |
-| `volume_30d`                    | Feeder via `update_tx_stats`  | `TxStats(subject).volume_30d` |
-| `on_time_count` / `total_count` | Lender via `record_repayment` | `RepaymentRecord(subject)`    |
-
-All inputs default to zero if never set. A subject with no history always scores exactly 300.
-
----
-
-## Formula — step by step
-
-### Step 1: Component scores (0–100 each)
-
-**VC score** — rewards having verified credentials, capped at 5 VCs:
+All arithmetic uses **integer division with truncation**, matching the contract,
+which operates on stroop (1 XLM = 100,000,000 stroops).
 
 ```
-vc_score = min(vc_count × 20, 100)
+vc_points            = vc_count × 20                          # 20 points per verified VC
+vc_score             = min(vc_points, 100)
+
+volume_score         = clamp(volume_30d_stroops ÷ 100_000_000, 0, 80)   # 1 point per XLM, cap 80
+counterparty_bonus   = min(avg_counterparties ÷ 5, 20)                  # 1 point per 5 counterparties, cap 20
+tx_score             = min(volume_score + counterparty_bonus, 100)
+
+repayment_rate_score   = (on_time_count × 10000 ÷ total_count) ÷ 100   # 0–100; 0 when total_count = 0
+repayment_volume_score = clamp(total_repaid_stroops ÷ 100_000_000, 0, 100)  # 1 point per XLM, cap 100
+repay_score            = (repayment_rate_score + repayment_volume_score) ÷ 2
 ```
 
-**Transaction score** — rewards on-chain transaction volume over the last 30 days.
-One unit of score per 100,000,000 stroops (1 XLM), capped at 100 XLM:
+### Composite and final score
 
 ```
-tx_score = min(volume_30d ÷ 100_000_000, 100)   [integer division]
+composite   = (vc_score × vc_weight
+             + tx_score × tx_weight
+             + repay_score × repayment_weight) ÷ 100
+
+final_score = clamp(300 + composite × 550 ÷ 100, 300, 850)
 ```
 
-**Repayment score** — rewards on-time repayment rate as a percentage:
+Default weights (governed on-chain via the governance contract, see
+[docs/governance.md](governance.md)):
 
-```
-repay_score = 0                                   if total_count = 0
-repay_score = (on_time_count × 10000 ÷ total_count) ÷ 100   [integer division]
-```
+| Weight       | Default |
+| ------------ | ------- |
+| `vc_weight`  | 40      |
+| `tx_weight`  | 30      |
+| `repayment_weight` | 30 |
 
-This gives a value of 0–100 representing the repayment percentage (e.g. 80% on-time → 80).
+### Edge cases
 
-### Step 2: Weighted composite (0–100)
-
-Default weights are **vc: 40, tx: 30, repayment: 30** (must sum to 100, configurable by admin):
-
-```
-composite = (vc_score × vc_weight + tx_score × tx_weight + repay_score × repayment_weight) ÷ 100
-```
-
-### Step 3: Final score (300–850)
-
-The composite is mapped onto the 300–850 range and clamped:
-
-```
-score = clamp(MIN_SCORE + composite × 550 ÷ 100, MIN_SCORE, MAX_SCORE)
-```
-
-The 550-point spread means a perfect composite of 100 yields `MIN_SCORE` + 550 = `MAX_SCORE`.
-
-### Optional VC recency decay
-
-By default, VC recency decay is disabled and scoring uses the feeder's cached
-`vc_count`, preserving the existing formula. An administrator can enable decay
-with `set_recency_decay`; when an identity-oracle is configured with
-`set_identity_oracle`, the credit-oracle reads each active VC's `anchored_at`
-timestamp and applies this multiplier to its 20 VC points:
-
-```
-recency_multiplier_bps = max(
-    min_recency_bps,
-    10_000 - age_days × decay_bps_per_day
-)
-vc_points = 20 × recency_multiplier_bps ÷ 10_000
-```
-
-Age is measured in whole 86,400-second days, and multipliers are clamped at
-the configured floor. The default parameters are 5 basis points of decay per
-day and a 5,000-basis-point (50%) floor. A minimum above 10,000 basis points
-is rejected. If decay is enabled without configuring an identity-oracle, the
-contract continues to use the cached VC count without applying decay.
-
----
+- **No history** (`total_count = 0`): `repayment_rate_score = 0` (division by
+  zero short-circuits to 0), so a subject with no repayment record earns nothing
+  from the repayment component.
+- **Negative volumes** are clamped to 0 via the `max(…, 0)` floors.
+- **Max-out**: `vc_score` caps at 100, `tx_score` caps at 100 (volume at 80 plus
+  up to 20 counterparty bonus), and `repay_score` caps at 100. To reach 850 a
+  subject needs 100+ counterparties on top of maxed VCs, volume, and repayment.
 
 ## Worked examples
 
-All examples use default weights: vc=40, tx=30, repayment=30.
+**Example scores** (all arithmetic uses integer division, matching the contract):
 
----
+| Profile     | VCs | 30d Volume | Total repaid | Counterparties | Repayment rate | Score |
+| ----------- | --- | ---------- | ------------ | -------------- | -------------- | ----- |
+| New user    | 0   | 0 XLM      | 0 XLM        | 0              | —              | 300   |
+| Early stage | 1   | 5 XLM      | 5 XLM        | 0              | 70%            | 410   |
+| Established | 2   | 20 XLM     | 20 XLM       | 0              | 85%            | 503   |
+| Strong      | 3   | 50 XLM     | 50 XLM       | 5              | 95%            | 630   |
+| Exceptional | ≥5  | 100+ XLM   | 100+ XLM     | 100+           | 100%           | 850   |
 
-### Example 1: New user, no history → score 300
+### New user (no history) → 300
 
-| Input           | Value     |
-| --------------- | --------- |
-| vc_count        | 0         |
-| volume_30d      | 0 stroops |
-| on_time / total | 0 / 0     |
-
-**Calculation:**
-
-```
-vc_score    = min(0 × 20, 100)  = 0
-tx_score    = min(0 ÷ 100_000_000, 100) = 0
-repay_score = 0  (no repayment history)
-
-composite = (0×40 + 0×30 + 0×30) ÷ 100 = 0
-
-score = clamp(MIN_SCORE + 0×550÷100, MIN_SCORE, MAX_SCORE) = MIN_SCORE
-```
-
-**Result: `MIN_SCORE` (300)** — the floor. Every new address starts here.
-
----
-
-### Example 2: 3 VCs, moderate volume, 80% repayment → score ~613
-
-| Input           | Value                          |
-| --------------- | ------------------------------ |
-| vc_count        | 3                              |
-| volume_30d      | 3,000,000,000 stroops (30 XLM) |
-| on_time / total | 8 / 10                         |
-
-**Calculation:**
+Inputs: `vc_count = 0`, no volume, no repayment record.
 
 ```
-vc_score    = min(3 × 20, 100) = min(60, 100) = 60
-tx_score    = min(3_000_000_000 ÷ 100_000_000, 100) = min(30, 100) = 30
-repay_score = (8 × 10000 ÷ 10) ÷ 100 = 8000 ÷ 100 = 80
-
-composite = (60×40 + 30×30 + 80×30) ÷ 100
-          = (2400 + 900 + 2400) ÷ 100
-          = 5700 ÷ 100
-          = 57
-
-score = clamp(300 + 57×550÷100, 300, 850)
-      = clamp(300 + 31350÷100, 300, 850)
-      = clamp(300 + 313, 300, 850)
-      = 613
+vc_score = 0, tx_score = 0, repayment_rate_score = 0, repayment_volume_score = 0
+repay_score = 0
+composite   = (0 + 0 + 0) ÷ 100 = 0
+final_score = 300 + 0 = 300
 ```
 
-**Result: 613** — a solid mid-range score reflecting real but moderate credit activity.
+### Established profile → 503
 
----
-
-### Example 3: 5 VCs, high volume, 100% repayment → score ~817
-
-| Input           | Value                          |
-| --------------- | ------------------------------ |
-| vc_count        | 5                              |
-| volume_30d      | 8,000,000,000 stroops (80 XLM) |
-| on_time / total | 20 / 20                        |
-
-**Calculation:**
+Inputs: 2 VCs, 20 XLM volume (2,000,000,000 stroops), 20 XLM total repaid,
+0 counterparties, 85% on-time repayment (17 on-time out of 20).
 
 ```
-vc_score    = min(5 × 20, 100) = min(100, 100) = 100
-tx_score    = min(8_000_000_000 ÷ 100_000_000, 100) = min(80, 100) = 80
-repay_score = (20 × 10000 ÷ 20) ÷ 100 = 10000 ÷ 100 = 100
-
-composite = (100×40 + 80×30 + 100×30) ÷ 100
-          = (4000 + 2400 + 3000) ÷ 100
-          = 9400 ÷ 100
-          = 94
-
-score = clamp(300 + 94×550÷100, 300, 850)
-      = clamp(300 + 51700÷100, 300, 850)
-      = clamp(300 + 517, 300, 850)
-      = 817
+vc_points            = 2 × 20 = 40                          → vc_score = 40
+volume_score         = 2,000,000,000 ÷ 100,000,000 = 20     → clamp(20, 0, 80) = 20
+counterparty_bonus   = min(0 ÷ 5, 20) = 0
+tx_score             = min(20 + 0, 100) = 20
+repayment_rate_score = (17 × 10000) ÷ 20 ÷ 100 = 8500 ÷ 100 = 85
+repayment_volume     = 2,000,000,000 ÷ 100,000,000 = 20     → clamp(20, 0, 100) = 20
+repay_score          = (85 + 20) ÷ 2 = 52
+composite            = (40×40 + 20×30 + 52×30) ÷ 100 = 3760 ÷ 100 = 37
+final_score          = 300 + 37×550 ÷ 100 = 300 + 203 = 503
 ```
 
-**Result: 817** — near the ceiling. Reaching 850 requires a perfect composite of 100, which needs ≥5 VCs, ≥100 XLM volume, and 100% repayment rate.
-
----
-
-## Edge cases
-
-### Stale score (`last_updated` more than 30 days ago)
-
-The contract does not enforce score freshness. `get_score` returns whatever was last computed, regardless of age. The `last_updated` field in `ScoreRecord` is a ledger timestamp (Unix seconds) that consumers should check.
-
-**Recommended consumer behaviour:** treat a score older than 30 days (2,592,000 seconds) as untrustworthy and prompt the subject or feeder to call `compute_score` again.
-
-The feeder is responsible for keeping `TxStats` and `VcCount` current. If the feeder stops updating, the score will drift from reality but will not error — it will simply reflect stale inputs.
-
-### All VCs revoked
-
-If a subject's VCs are all revoked in identity-oracle, `is_verified` returns `false`. However, the credit-oracle's `VcCount` cache is not automatically updated — it reflects whatever the feeder last submitted via `set_vc_count`.
-
-**Implication:** a lender should always check `is_verified` on identity-oracle independently of the credit score. A high score with `is_verified = false` indicates the feeder has not yet synced the revocation.
-
-In the future cross-contract version, `compute_score` will call `get_active_vc_count` directly, eliminating this lag.
-
-### Feeder not updated (inputs never set)
-
-If `set_vc_count` and `update_tx_stats` have never been called for a subject, both default to zero. The score will be driven entirely by repayment history (weight 30), with a maximum possible score of:
+Cross-checked by the unit test `scoring_examples`:
 
 ```
-composite = (0×40 + 0×30 + 100×30) ÷ 100 = 30
-score = 300 + 30×550÷100 = 300 + 165 = 465
+cargo test -p credit-oracle -- scoring_examples
 ```
 
-A subject with perfect repayment history but no feeder data is capped at **465**. This is intentional — the protocol requires active data submission to unlock higher scores.
+### Exceptional profile → 850
 
-### Integer division truncation
+Inputs: ≥5 VCs (vc_points capped at 100), 100+ XLM volume, 100+ XLM total repaid,
+100+ counterparties, 100% on-time repayment.
 
-All arithmetic uses integer (floor) division, matching Soroban's `u32`/`i128` semantics. This means:
+```
+vc_score             = min(100, 100) = 100
+volume_score         = min(100, 80) = 80
+counterparty_bonus   = min(100 ÷ 5, 20) = 20
+tx_score             = min(80 + 20, 100) = 100
+repayment_rate_score = (20 × 10000) ÷ 20 ÷ 100 = 100
+repayment_volume     = 100
+repay_score          = (100 + 100) ÷ 2 = 100
+composite            = (100×40 + 100×30 + 100×30) ÷ 100 = 100
+final_score          = 300 + 100×550 ÷ 100 = 850
+```
 
-- A repayment rate of 9/10 = 90% gives `repay_score = 90`, not 90.0
-- A volume of 150,000,000 stroops gives `tx_score = 1`, not 1.5
-- A composite of 57.3 gives `score = 300 + 57×550÷100 = 613`, not 614
+## Freshness and State Synchronization
 
-Consumers should be aware that two subjects with slightly different inputs may receive the same score due to truncation.
+To prevent lenders from evaluating scores derived from outdated credential
+states, the `credit-oracle` tracks state updates via the `identity-oracle`
+contract.
+
+- **Last Identity State Change Tracking**: Whenever a subject's verifiable
+  credentials are anchored or revoked, the `identity-oracle` records the current
+  ledger sequence via `get_last_state_change_ledger(subject)`.
+- **Dynamic Staleness Check**: When `get_score(subject)` is called on the
+  `credit-oracle`, it performs a cross-contract lookup to compare
+  `ScoreRecord.computed_at_ledger` against the subject's latest identity state
+  change ledger. If `computed_at_ledger < last_state_change`, the returned
+  `ScoreRecord` sets `stale: true`.
