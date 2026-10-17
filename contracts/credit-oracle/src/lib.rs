@@ -1,7 +1,7 @@
 #![no_std]
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, symbol_short, Address,
-    BytesN, Env, Vec,
+    BytesN, Env, Symbol, Vec,
 };
 
 pub const MIN_SCORE: u32 = 300;
@@ -206,6 +206,10 @@ impl CreditOracle {
         env.storage()
             .instance()
             .set(&DataKey::IdentityOracleId, &identity_oracle_id);
+        env.events().publish(
+            (Symbol::new(&env, "IdentityOracleUpdated"),),
+            identity_oracle_id,
+        );
         Ok(())
     }
 
@@ -497,7 +501,34 @@ impl CreditOracle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::testutils::{Address as _, Ledger as _};
+    use soroban_sdk::{
+        testutils::{Address as _, Events as _, Ledger as _},
+        TryFromVal,
+    };
+
+    #[test]
+    fn test_set_identity_oracle_emits_descriptive_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, CreditOracle);
+        let client = CreditOracleClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let identity_oracle_id = Address::generate(&env);
+
+        client.initialize(&admin);
+        client.set_identity_oracle(&admin, &identity_oracle_id);
+
+        let events = env.events().all();
+        let (_, topics, data) = events.get(events.len() - 1).unwrap();
+        assert_eq!(
+            Symbol::try_from_val(&env, &topics.get(0).unwrap()).unwrap(),
+            Symbol::new(&env, "IdentityOracleUpdated")
+        );
+        assert_eq!(
+            Address::try_from_val(&env, &data).unwrap(),
+            identity_oracle_id
+        );
+    }
 
     #[test]
     fn test_default_weights_sum_to_100() {
