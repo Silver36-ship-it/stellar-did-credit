@@ -451,6 +451,11 @@ impl IdentityOracle {
         Ok(())
     }
 
+    /// Returns the contract administrator address, or `None` before initialization.
+    pub fn get_admin(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::Admin)
+    }
+
     /// Pause all writes on the contract.
     pub fn pause(env: Env) -> Result<(), IdentityOracleError> {
         require_admin(&env);
@@ -2056,6 +2061,20 @@ mod tests {
             env.storage().instance().get(&DataKey::Admin).unwrap()
         });
         assert_eq!(stored, admin);
+    }
+
+    #[test]
+    fn test_get_admin_returns_none_until_initialized_then_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, IdentityOracle);
+        let client = IdentityOracleClient::new(&env, &contract_id);
+
+        assert_eq!(client.get_admin(), None);
+
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+        assert_eq!(client.get_admin(), Some(admin));
     }
 
     #[test]

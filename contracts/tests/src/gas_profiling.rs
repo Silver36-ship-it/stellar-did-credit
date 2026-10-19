@@ -44,6 +44,15 @@ mod tests {
 
         let mut profiles: std::vec::Vec<GasProfileResult> = std::vec::Vec::new();
 
+        env.budget().reset_default();
+        let _identity_admin = identity.get_admin();
+        profiles.push(GasProfileResult {
+            operation: "get_admin",
+            input_size: 1,
+            cpu_instructions: env.budget().cpu_instruction_cost(),
+            memory_bytes: env.budget().memory_bytes_cost(),
+        });
+
         for count in 1..=3 {
             let vc_hash = BytesN::from_array(&env, &[count as u8; 32]);
             env.budget().reset_default();
@@ -112,6 +121,7 @@ mod tests {
         }
 
         assert!(!profiles.is_empty());
+        assert!(profiles.iter().any(|p| p.operation == "get_admin"));
         assert!(profiles.iter().any(|p| p.operation == "anchor_vc"));
         assert!(profiles.iter().any(|p| p.operation == "record_repayment"));
         assert!(profiles.iter().any(|p| p.operation == "compute_score"));

@@ -44,11 +44,12 @@ The repository provides two complementary tools for gas budget estimation:
 
 ## Empirical Resource Benchmark Matrix
 
-The following benchmarks were recorded across the five core protocol operations (`compute_score`, `anchor_vc`, `record_repayment`, `batch_revoke`, `get_score`):
+The following benchmarks were recorded across the core protocol operations (`compute_score`, `anchor_vc`, `record_repayment`, `batch_revoke`, `get_score`, `get_admin`):
 
 | Operation | Target Contract | Input Dimension | CPU Instructions | Memory Allocation (Bytes) | Read Entries | Write Entries | Base Complexity |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 | `get_score` | `credit-oracle` | 1 Subject | **45,120** | **6,800** | 1 | 0 | $O(1)$ Read-only |
+| `get_admin` | `identity-oracle` | 1 Contract | Measured by gas harness | Measured by gas harness | 1 | 0 | $O(1)$ Read-only |
 | `record_repayment` | `credit-oracle` | 1 Record | **142,300** | **18,950** | 2 | 1 | $O(1)$ Write |
 | `anchor_vc` | `identity-oracle` | 1 VC Hash | **185,420** | **24,110** | 3 | 2 | $O(1)$ Write + Index |
 | `compute_score` | `credit-oracle` | 3 Active VCs | **320,850** | **41,200** | 4 | 1 | $O(V)$ Score Aggregation |
