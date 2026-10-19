@@ -2,12 +2,14 @@
 name = "identity-oracle"
 version = "0.1.0"
 edition = "2021"
+license = "Apache-2.0"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 soroban-sdk = { workspace = true }
+credit-oracle-types = { path = "../credit-oracle-types" }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }

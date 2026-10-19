@@ -1,0 +1,10 @@
+pre-commit:
+  commands:
+    scan-secrets:
+      run: >
+        echo "Scanning for Stellar secret keys..." &&
+        git diff --cached --name-only |
+        xargs -r grep -l "S[A-Z2-7]\{55\}" 2>/dev/null |
+        grep -v "\.example$" &&
+        echo "ERROR: Stellar secret key detected" &&
+        exit 1 || echo "No secrets found"
