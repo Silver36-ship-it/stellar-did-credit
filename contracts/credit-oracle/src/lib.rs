@@ -1432,8 +1432,8 @@ impl CreditOracle {
     /// identity-oracle instead of reading the cached `VcCount` storage key.
     /// This enables live VC count resolution that automatically excludes revoked VCs.
     ///
-    /// Emits an `IdOSet` event with the new identity oracle address so indexers
-    /// and monitoring tools can detect configuration changes.
+    /// Emits an `IdentityOracleUpdated` event with the new identity oracle
+    /// address so indexers and monitoring tools can detect configuration changes.
     ///
     /// Auth: admin only.
     pub fn set_identity_oracle(
@@ -1457,7 +1457,10 @@ impl CreditOracle {
             .instance()
             .set(&DataKey::IdentityOracleId, &identity_oracle_id);
         env.events()
-            .publish((symbol_short!("IdOSet"),), identity_oracle_id);
+            .publish(
+                (Symbol::new(&env, "IdentityOracleUpdated"),),
+                identity_oracle_id,
+            );
         Ok(())
     }
 
@@ -2893,7 +2896,7 @@ mod tests {
     }
 
     #[test]
-    fn test_set_identity_oracle_emits_idoset() {
+    fn test_set_identity_oracle_emits_descriptive_event() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register_contract(None, CreditOracle);
@@ -2906,9 +2909,9 @@ mod tests {
         client.set_identity_oracle(&admin, &identity_oracle_id);
 
         let events = env.events().all();
-        // Filter for the IdOSet event from this contract (robust to
+        // Filter for the identity-oracle update event from this contract (robust to
         // additional setup events such as Initialized).
-        let mut idoset_count = 0u32;
+        let mut identity_oracle_updated_count = 0u32;
         for (event_contract_id, topics, data) in events.iter() {
             if event_contract_id != contract_id || topics.len() != 1 {
                 continue;
@@ -2918,7 +2921,7 @@ mod tests {
                 .unwrap()
                 .try_into_val(&env)
                 .expect("topic should be a Symbol");
-            if topic_sym != symbol_short!("IdOSet") {
+            if topic_sym != Symbol::new(&env, "IdentityOracleUpdated") {
                 continue;
             }
             let event_oracle: Address = data.try_into_val(&env).expect("data should be an Address");
@@ -2926,9 +2929,12 @@ mod tests {
                 event_oracle, identity_oracle_id,
                 "event data should be the new identity oracle address"
             );
-            idoset_count += 1;
+            identity_oracle_updated_count += 1;
         }
-        assert_eq!(idoset_count, 1, "expected exactly one IdOSet event");
+        assert_eq!(
+            identity_oracle_updated_count, 1,
+            "expected exactly one IdentityOracleUpdated event"
+        );
     }
 
     #[test]
