@@ -3530,6 +3530,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_set_vc_count_does_not_emit_deprecation_event_without_oracle() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, CreditOracle);
+        let client = CreditOracleClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let feeder = Address::generate(&env);
+        let subject = Address::generate(&env);
+
+        client.initialize(&admin);
+        client.register_feeder(&admin, &feeder);
+        let setup_event_count = env.events().all().len();
+
+        client.set_vc_count(&feeder, &subject, &5);
+
+        let events = env.events().all();
+        for i in setup_event_count..events.len() {
+            let (event_contract_id, topics, _) = events.get(i).unwrap();
+            if event_contract_id == contract_id && topics.len() == 1 {
+                let topic: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+                assert_ne!(topic, symbol_short!("VcCntDep"));
+            }
+        }
+    }
+
     // -----------------------------------------------------------------
     // Issue #530: VC recency decay
     // -----------------------------------------------------------------
