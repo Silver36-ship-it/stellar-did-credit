@@ -903,6 +903,36 @@ mod tests {
         assert_eq!(list2.get(0).unwrap(), hash_d);
     }
 
+    /// Issue #933: once the governance contract accepts the credit-oracle admin
+    /// role through `accept_oracle_admin`, `credit-oracle.get_governance()`
+    /// reports it (the reverse lookup of governance's stored credit-oracle).
+    #[test]
+    fn test_get_governance_reports_governance_after_accept_oracle_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let credit_id = env.register(CreditOracle, ());
+        let gov_id = env.register(Governance, ());
+        let credit = CreditOracleClient::new(&env, &credit_id);
+        let gov = GovernanceClient::new(&env, &gov_id);
+
+        let admin = soroban_sdk::Address::generate(&env);
+        credit.initialize(&admin);
+        gov.initialize(&admin, &credit_id, &100);
+        assert_eq!(credit.get_governance(), None);
+
+        credit.propose_new_admin(&gov_id);
+        assert_eq!(
+            credit.get_governance(),
+            None,
+            "proposing governance as admin must not record it yet"
+        );
+
+        gov.accept_oracle_admin();
+        assert_eq!(credit.get_governance(), Some(gov_id.clone()));
+        assert_eq!(credit.get_admin(), Some(gov_id));
+    }
+
     /// Integration test: create a proposal, cancel it, then verify execute fails
     /// with ProposalAlreadyCancelled.
     ///
@@ -1167,6 +1197,71 @@ mod tests {
             res,
             Err(Ok(GovernanceError::ProposalAlreadyCancelled)),
             "executing a cancelled proposal must return ProposalAlreadyCancelled"
+        );
+    }
+
+    /// An executed governance proposal cannot be cancelled while its queued
+    /// credit-oracle weights are waiting for the oracle timelock.
+    #[test]
+    fn test_cancel_executed_proposal_preserves_pending_oracle_weights() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let credit_id = env.register_contract(None, CreditOracle);
+        let gov_id = env.register_contract(None, Governance);
+
+        let credit = CreditOracleClient::new(&env, &credit_id);
+        let gov = GovernanceClient::new(&env, &gov_id);
+
+        let admin = Address::generate(&env);
+        credit.initialize(&admin);
+        gov.initialize(&admin, &credit_id, &100);
+
+        credit.propose_new_admin(&gov_id);
+        gov.accept_oracle_admin();
+
+        let proposed_weights = ScoringWeights {
+            vc_weight: 50,
+            tx_weight: 20,
+            repayment_weight: 30,
+        };
+        let proposer = Address::generate(&env);
+        let proposal_id = gov.create_proposal(&proposer, &proposed_weights, &100, &0);
+
+        let voter = Address::generate(&env);
+        gov.register_voter(&admin, &voter, &200);
+        gov.vote(&voter, &proposal_id, &true, &200);
+
+        env.ledger().with_mut(|ledger| {
+            ledger.sequence_number += 101;
+        });
+        gov.execute(&proposal_id);
+
+        let cancel_result = gov.try_cancel_proposal(&proposer, &proposal_id);
+        assert_eq!(
+            cancel_result,
+            Err(Ok(GovernanceError::ProposalAlreadyExecuted))
+        );
+
+        let proposal = gov.get_proposal(&proposal_id).unwrap();
+        assert!(proposal.executed);
+        assert!(!proposal.cancelled);
+
+        let active_weights = credit.get_scoring_weights();
+        assert_eq!(active_weights.vc_weight, 40);
+        assert_eq!(active_weights.tx_weight, 30);
+        assert_eq!(active_weights.repayment_weight, 30);
+
+        let pending = credit.get_pending_weights().unwrap();
+        assert_eq!(pending.weights.vc_weight, proposed_weights.vc_weight);
+        assert_eq!(pending.weights.tx_weight, proposed_weights.tx_weight);
+        assert_eq!(
+            pending.weights.repayment_weight,
+            proposed_weights.repayment_weight
+        );
+        assert!(
+            pending.effective_ledger > env.ledger().sequence(),
+            "the oracle timelock must not have expired"
         );
     }
 
@@ -1831,6 +1926,65 @@ mod tests {
         assert_eq!(rec1_v2_updated.total_repaid, 5000);
     }
 
+    /// Issue #932: identity-oracle's `get_vc_details` and the credit-oracle's
+    /// cross-contract decode share one type, `IdentityVCRecord`.
+    ///
+    /// The second half decodes the call exactly the way `compute_score` does
+    /// (`invoke_contract::<Vec<IdentityVCRecord>>`), and both halves must see only
+    /// the active (non-revoked) records with every field intact.
+    #[test]
+    fn test_get_vc_details_decodes_as_shared_identity_vc_record() {
+        use soroban_sdk::IntoVal as _;
+
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(1_700_000_000);
+
+        let identity_id = env.register(IdentityOracle, ());
+        let identity = IdentityOracleClient::new(&env, &identity_id);
+
+        let admin = soroban_sdk::Address::generate(&env);
+        let issuer = soroban_sdk::Address::generate(&env);
+        let subject = soroban_sdk::Address::generate(&env);
+        identity.initialize(&admin);
+        identity.register_issuer(&issuer);
+
+        let hash_a = BytesN::from_array(&env, &[1u8; 32]);
+        let hash_b = BytesN::from_array(&env, &[2u8; 32]);
+        identity.anchor_vc(&issuer, &subject, &hash_a);
+        env.ledger().set_timestamp(1_700_000_500);
+        identity.anchor_vc(&issuer, &subject, &hash_b);
+
+        // Typed client return value.
+        let details = identity.get_vc_details(&subject);
+        assert_eq!(details.len(), 2);
+        let first = details.get(0).unwrap();
+        let second = details.get(1).unwrap();
+        assert_eq!(first.vc_hash, hash_a);
+        assert_eq!(first.issuer, issuer);
+        assert_eq!(first.anchored_at, 1_700_000_000);
+        assert!(!first.revoked);
+        assert_eq!(second.vc_hash, hash_b);
+        assert_eq!(second.anchored_at, 1_700_000_500);
+
+        // Decode as the credit-oracle does; it must be the same shared type.
+        let decoded = env.invoke_contract::<soroban_sdk::Vec<credit_oracle::IdentityVCRecord>>(
+            &identity_id,
+            &Symbol::new(&env, "get_vc_details"),
+            soroban_sdk::vec![&env, subject.clone().into_val(&env)],
+        );
+        assert_eq!(decoded.len(), 2);
+        let decoded_first: credit_oracle::IdentityVCRecord = decoded.get(0).unwrap();
+        assert_eq!(decoded_first.vc_hash, hash_a);
+        assert_eq!(decoded_first.anchored_at, 1_700_000_000);
+
+        // Revoked records drop out of both views.
+        identity.mark_vc_revoked(&issuer, &subject, &hash_a);
+        let remaining = identity.get_vc_details(&subject);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining.get(0).unwrap().vc_hash, hash_b);
+    }
+
     #[test]
     fn test_identity_oracle_migration_flow() {
         let env = Env::default();
@@ -1847,7 +2001,7 @@ mod tests {
         let mut hash_bytes = [0u8; 32];
         hash_bytes[0] = 42;
         let vc_hash = BytesN::from_array(&env, &hash_bytes);
-        let vc_record = identity_oracle::VCRecord {
+        let vc_record = identity_oracle::IdentityVCRecord {
             vc_hash: vc_hash.clone(),
             issuer: issuer.clone(),
             anchored_at: env.ledger().timestamp(),
@@ -1971,6 +2125,61 @@ mod tests {
         assert_eq!(
             result,
             Err(Ok(credit_oracle::CreditOracleError::ComputeCooldownActive))
+        );
+    }
+
+    /// Deploy credit-oracle alongside identity-oracle, then verify the default
+    /// compute cooldown blocks a rapid re-computation and allows it once the
+    /// ledger advances past the cooldown window.
+    #[test]
+    fn test_compute_score_cooldown_with_identity_oracle() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let identity_id = env.register_contract(None, IdentityOracle);
+        let credit_id = env.register_contract(None, CreditOracle);
+
+        let identity = IdentityOracleClient::new(&env, &identity_id);
+        let credit = CreditOracleClient::new(&env, &credit_id);
+
+        let admin = soroban_sdk::Address::generate(&env);
+        identity.initialize(&admin);
+        credit.initialize(&admin);
+
+        let issuer = soroban_sdk::Address::generate(&env);
+        identity.register_issuer(&issuer);
+
+        let subject = soroban_sdk::Address::generate(&env);
+        let cid = String::from_str(&env, "ipfs://QmCooldownTestDID");
+        identity.anchor_did(&subject, &cid);
+        let vc_hash = BytesN::from_array(&env, &[42u8; 32]);
+        identity.anchor_vc(&issuer, &subject, &vc_hash);
+
+        // Deploy credit-oracle with identity-oracle as its live data source.
+        credit.set_identity_oracle(&admin, &identity_id);
+        assert_eq!(credit.get_compute_cooldown_ledgers(), 1);
+
+        let first_score = credit.compute_score(&subject);
+        let first_ledger = env.ledger().sequence();
+        let record = credit.get_score(&subject).unwrap();
+        assert_eq!(record.computed_at_ledger, first_ledger);
+
+        // Recomputing in the same ledger must fail with ComputeCooldownActive.
+        let result = credit.try_compute_score(&subject);
+        assert_eq!(
+            result,
+            Err(Ok(CreditOracleError::ComputeCooldownActive)),
+            "expected ComputeCooldownActive while cooldown is active"
+        );
+
+        // Advance one ledger past the cooldown window (default 1 ledger).
+        env.ledger().set_sequence_number(first_ledger + 1);
+
+        // Recomputation now succeeds and returns the same score for unchanged inputs.
+        let second_score = credit.compute_score(&subject);
+        assert_eq!(
+            second_score, first_score,
+            "expected recomputation to succeed with unchanged inputs"
         );
     }
 

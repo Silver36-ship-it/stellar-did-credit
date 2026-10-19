@@ -1,5 +1,8 @@
 #![no_std]
-pub use credit_oracle_types::{CreditOracleError, PendingWeightsRecord, ScoringWeights};
+pub use credit_oracle_types::{
+    CredentialType, CreditOracleError, IdentityOracleClient, IdentityVCRecord,
+    PendingWeightsRecord, ScoringWeights,
+};
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, IntoVal, String,
     Symbol, TryFromVal, Val, Vec,
@@ -33,7 +36,7 @@ pub enum DataKey {
     /// Global configuration
     Config,
     /// Registered weight for a VC credential type (default 100 when unset)
-    VcWeight(Symbol),
+    VcWeight(CredentialType),
     /// Whether the given address is a *currently* trusted transaction-stats
     /// feeder. Present and `true` while registered; present and `false` once
     /// deregistered (a tombstone, not removed) so re-registration can be told
@@ -88,12 +91,16 @@ pub enum DataKey {
     DecayBpsPerDay,
     /// Issue #530: lower bound (bps) the recency multiplier may decay to.
     MinRecencyBps,
+    /// Issue #933: governance contract that currently holds the admin role.
+    /// Written by `accept_admin` when the accepting address is a contract and
+    /// removed when an account address accepts. Read via `get_governance`.
+    GovernanceId,
 }
 
 /// Basis-point denominator: 10_000 bps == 1.00x multiplier.
 pub const BPS_DENOMINATOR: u32 = 10_000;
 
-/// Seconds in one day. `VCRecord.anchored_at` is a ledger timestamp in Unix
+/// Seconds in one day. `IdentityVCRecord.anchored_at` is a ledger timestamp in Unix
 /// seconds, so credential age must be divided by this to obtain whole days.
 pub const SECONDS_PER_DAY: u64 = 86_400;
 
@@ -211,6 +218,22 @@ where
     )
 }
 
+/// Returns `true` when `addr` is a contract address (strkey prefix `C`) and
+/// `false` for an account address (prefix `G`).
+///
+/// `soroban-sdk` 22 has no `Address::executable()`, and an `Address` carries no
+/// public discriminant, so the strkey form is inspected instead.
+fn is_contract_address(addr: &Address) -> bool {
+    let strkey = addr.to_string();
+    // G... and C... strkeys are both 56 characters.
+    if strkey.len() != 56 {
+        return false;
+    }
+    let mut buf = [0u8; 56];
+    strkey.copy_into_slice(&mut buf);
+    buf[0] == b'C'
+}
+
 fn validate_identity_oracle_ref(env: &Env, identity_oracle_id: &Address) -> bool {
     let dummy_subject = env.current_contract_address();
     validate_contract_function::<u32>(
@@ -291,20 +314,6 @@ pub struct VcEntry {
     /// Optional credential type label (e.g., "kyc", "employment").
     /// `None` defaults to weight 100.
     pub vc_type: Option<Symbol>,
-}
-
-/// An on-chain anchor record for a verifiable credential in the identity oracle.
-#[contracttype]
-#[derive(Clone)]
-pub struct IdentityVCRecord {
-    /// SHA-256 hash of the off-chain verifiable credential JSON.
-    pub vc_hash: BytesN<32>,
-    /// Address of the issuer who anchored this credential.
-    pub issuer: Address,
-    /// Ledger timestamp (Unix seconds) when this credential was anchored.
-    pub anchored_at: u64,
-    /// Whether this credential has been revoked by the issuer.
-    pub revoked: bool,
 }
 
 /// Status of an on-chain score input dispute.
@@ -912,7 +921,7 @@ impl CreditOracle {
     /// When `enabled`, `compute_score` multiplies each credential's weighted
     /// points by
     ///   `max(min_recency_bps, 10_000 - age_days * decay_bps_per_day) / 10_000`
-    /// where `age_days` derives from `VCRecord.anchored_at`. Decay therefore
+    /// where `age_days` derives from `IdentityVCRecord.anchored_at`. Decay therefore
     /// only applies on the cross-contract path, which requires
     /// `set_identity_oracle` to have been called - `anchored_at` is only
     /// available from `get_vc_details`.
@@ -1123,10 +1132,11 @@ impl CreditOracle {
                     continue;
                 }
                 vc_count += 1;
-                let vc_type = env.invoke_contract::<Symbol>(
+                let vc_type = IdentityOracleClient::get_vc_credential_type(
+                    &env,
                     &identity_oracle_id,
-                    &Symbol::new(&env, "get_vc_credential_type"),
-                    soroban_sdk::vec![&env, subject.clone().into_val(&env), record.vc_hash.clone().into_val(&env)],
+                    &subject,
+                    &record.vc_hash,
                 );
                 let weight = env
                     .storage()
@@ -1462,6 +1472,18 @@ impl CreditOracle {
         env.storage().instance().get(&DataKey::IdentityOracleId)
     }
 
+    /// Returns the governance contract address, or `None` if no governance
+    /// contract currently holds the admin role.
+    ///
+    /// Set when a contract address accepts the admin role through
+    /// `accept_admin` (the governance contract does this in its
+    /// `accept_oracle_admin`); cleared if an account address later accepts it.
+    /// This is the reverse lookup of the governance contract's stored
+    /// credit-oracle address.
+    pub fn get_governance(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::GovernanceId)
+    }
+
     /// Get pending weights (if any)
     pub fn get_pending_weights(env: Env) -> Option<PendingWeightsRecord> {
         let weights: Option<ScoringWeights> =
@@ -1509,6 +1531,18 @@ impl CreditOracle {
         }
         env.storage().instance().set(&DataKey::Admin, &new_admin);
         env.storage().instance().remove(&DataKey::PendingAdmin);
+        // Issue #933: when a contract (the governance contract, via its
+        // `accept_oracle_admin`) takes the admin role, record it so off-chain
+        // tools can discover governance from this contract. An account address
+        // is a human admin, not governance, so any stale entry is cleared and
+        // `get_governance` never reports a non-contract address.
+        if is_contract_address(&new_admin) {
+            env.storage()
+                .instance()
+                .set(&DataKey::GovernanceId, &new_admin);
+        } else {
+            env.storage().instance().remove(&DataKey::GovernanceId);
+        }
         env.events()
             .publish((symbol_short!("AdmAccept"),), new_admin);
         Ok(())
@@ -1770,7 +1804,9 @@ mod prop_tests;
 mod tests {
     use super::*;
     use proptest::prelude::*;
-    use identity_oracle::{IdentityOracle, IdentityOracleClient};
+    // Qualified so it does not shadow the shared `IdentityOracleClient` imported
+    // from `credit-oracle-types` at the crate root.
+    use identity_oracle::IdentityOracle;
     use soroban_sdk::testutils::{Address as _, Events as _, Ledger as _};
     use soroban_sdk::TryIntoVal;
 
@@ -2936,6 +2972,93 @@ mod tests {
         client.propose_new_admin(&admin2);
 
         let _ = client.accept_admin(&non_admin);
+    }
+
+    #[test]
+    fn test_get_governance_returns_none_when_not_configured() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, CreditOracle);
+        let client = CreditOracleClient::new(&env, &contract_id);
+
+        // Before initialize and after it, no governance contract is recorded.
+        assert_eq!(client.get_governance(), None);
+        client.initialize(&Address::generate(&env));
+        assert_eq!(client.get_governance(), None);
+    }
+
+    #[test]
+    fn test_get_governance_set_when_contract_accepts_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, CreditOracle);
+        let client = CreditOracleClient::new(&env, &contract_id);
+
+        // Any registered contract stands in for the governance contract: only
+        // its contract (C...) address form matters here.
+        let governance = env.register(CreditOracle, ());
+
+        client.initialize(&Address::generate(&env));
+        client.propose_new_admin(&governance);
+        assert_eq!(
+            client.get_governance(),
+            None,
+            "a pending proposal must not set governance"
+        );
+
+        client.accept_admin(&governance);
+        assert_eq!(client.get_governance(), Some(governance.clone()));
+        assert_eq!(client.get_admin(), Some(governance));
+    }
+
+    #[test]
+    fn test_get_governance_not_set_when_account_accepts_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, CreditOracle);
+        let client = CreditOracleClient::new(&env, &contract_id);
+
+        // `Address::generate` yields contract-form (C...) addresses in the test
+        // environment, so real account (G...) addresses are built explicitly.
+        let admin1 = Address::generate(&env);
+        let account = Address::from_str(
+            &env,
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+        );
+
+        client.initialize(&admin1);
+        client.propose_new_admin(&account);
+        client.accept_admin(&account);
+
+        // A human (account) admin is not a governance contract.
+        assert_eq!(client.get_admin(), Some(account));
+        assert_eq!(client.get_governance(), None);
+    }
+
+    #[test]
+    fn test_get_governance_cleared_when_admin_returns_to_account() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, CreditOracle);
+        let client = CreditOracleClient::new(&env, &contract_id);
+
+        let governance = env.register(CreditOracle, ());
+        let human = Address::from_str(
+            &env,
+            "GAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHV4",
+        );
+
+        client.initialize(&Address::generate(&env));
+        client.propose_new_admin(&governance);
+        client.accept_admin(&governance);
+        assert_eq!(client.get_governance(), Some(governance));
+
+        // Governance hands the admin role back to an account: the stale
+        // governance entry must not survive.
+        client.propose_new_admin(&human);
+        client.accept_admin(&human);
+        assert_eq!(client.get_admin(), Some(human));
+        assert_eq!(client.get_governance(), None);
     }
 
     #[test]
