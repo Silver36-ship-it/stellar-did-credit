@@ -95,6 +95,13 @@ export interface GovernanceProposal {
   quorumRequired: bigint;
 }
 
+/** An issuer and its configured trust multiplier, returned by listIssuerTiers. */
+export interface IssuerTier {
+  issuer: string;
+  bps: number;
+  multiplier: string;
+}
+
 export interface IdentityProtocolStats {
   totalDIDsAnchored: number;
   totalVCsAnchored: number;
@@ -2095,6 +2102,66 @@ export class StellarDIDCreditSDK {
     return count;
   }
 
+  /** Check whether a credential hash has been revoked. */
+  async isRevoked(vcHash: Buffer): Promise<boolean> {
+    if (vcHash.length !== 32) throw new Error("vcHash must be exactly 32 bytes");
+    const contract = new Contract(this.config.revocationRegistryId);
+    const sourceAccount = new Account(this.config.simAccount, "0");
+    const tx = new TransactionBuilder(sourceAccount, {
+      fee: this.config.baseFee || BASE_FEE,
+      networkPassphrase: this.config.networkPassphrase,
+    }).addOperation(contract.call("is_revoked", nativeToScVal(new Uint8Array(vcHash), { type: "bytes" })))
+      .setTimeout(this.config.timeoutSeconds ?? 30).build();
+    const sim = await this.server.simulateTransaction(tx);
+    if (SorobanRpc.Api.isSimulationError(sim)) throwContractError(sim.error, "revocation-registry");
+    if (!SorobanRpc.Api.isSimulationSuccess(sim)) throw new Error("Simulation returned unexpected response");
+    const result = sim.result?.retval;
+    if (!result) throw new Error("No return value in simulation result");
+    const value = scValToNative(result);
+    if (typeof value !== "boolean") throw new Error("is_revoked returned a non-boolean result");
+    return value;
+  }
+
+  /** Return the issuer that revoked a credential, or null when it is not revoked. */
+  async getRevocationRecord(vcHash: Buffer): Promise<string | null> {
+    if (vcHash.length !== 32) throw new Error("vcHash must be exactly 32 bytes");
+    const contract = new Contract(this.config.revocationRegistryId);
+    const sourceAccount = new Account(this.config.simAccount, "0");
+    const tx = new TransactionBuilder(sourceAccount, {
+      fee: this.config.baseFee || BASE_FEE,
+      networkPassphrase: this.config.networkPassphrase,
+    }).addOperation(contract.call("get_revocation_record", nativeToScVal(new Uint8Array(vcHash), { type: "bytes" })))
+      .setTimeout(this.config.timeoutSeconds ?? 30).build();
+    const sim = await this.server.simulateTransaction(tx);
+    if (SorobanRpc.Api.isSimulationError(sim)) throwContractError(sim.error, "revocation-registry");
+    if (!SorobanRpc.Api.isSimulationSuccess(sim)) throw new Error("Simulation returned unexpected response");
+    const result = sim.result?.retval;
+    if (!result) throw new Error("No return value in simulation result");
+    const value = scValToNative(result);
+    if (value === null || value === undefined) return null;
+    if (typeof value !== "string") throw new Error("get_revocation_record returned an invalid issuer");
+    return value;
+  }
+
+  /** Return the number of credentials revoked by an issuer. */
+  async getRevocationCount(issuer: string): Promise<number> {
+    const contract = new Contract(this.config.revocationRegistryId);
+    const sourceAccount = new Account(this.config.simAccount, "0");
+    const tx = new TransactionBuilder(sourceAccount, {
+      fee: this.config.baseFee || BASE_FEE,
+      networkPassphrase: this.config.networkPassphrase,
+    }).addOperation(contract.call("get_revocation_count", new Address(issuer).toScVal()))
+      .setTimeout(this.config.timeoutSeconds ?? 30).build();
+    const sim = await this.server.simulateTransaction(tx);
+    if (SorobanRpc.Api.isSimulationError(sim)) throwContractError(sim.error, "revocation-registry");
+    if (!SorobanRpc.Api.isSimulationSuccess(sim)) throw new Error("Simulation returned unexpected response");
+    const result = sim.result?.retval;
+    if (!result) throw new Error("No return value in simulation result");
+    const count = scValToNative(result);
+    if (typeof count !== "number" || !Number.isInteger(count) || count < 0) throw new Error("get_revocation_count returned an invalid count");
+    return count;
+  }
+
   /**
    * Fetch the list of verifiable credential anchors for a subject from the
    * identity-oracle, including revoked entries.
@@ -2985,7 +3052,6 @@ export class StellarDIDCreditSDK {
    * Uses a read-only simulation against the identity-oracle contract.
    *
    * @returns Array of Stellar G... addresses of registered issuers
-   * @alias listIssuers
    */
   async getRegisteredIssuers(): Promise<string[]> {
     return this.listIssuers();

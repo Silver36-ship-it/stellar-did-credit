@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `packages/cli` (`@stellar-did-credit/cli`): added an `upgrade` command group with `identity`, `credit`, and `revocation` subcommands to upgrade contract WASM bytecode in-place (admin only). Each takes `<admin-secret> <wasm-hash>`, validates that the hash is 64 hex characters (32 bytes), and supports `--dry-run` to simulate the upgrade without broadcasting. Contract upgrades are irreversible once confirmed on-chain (#963)
 - Feeder: `/health` now includes `deadLetterCount` and `deadLetterSubjects`, refreshed after each polling cycle to reflect failures and recovery (#953).
 - `packages/cli` (`@stellar-did-credit/cli`): added `cooldown` command to view compute score cooldown in ledgers and approximate wall-clock time from the credit-oracle with formatted table output and `--json` support (#949)
 - `packages/cli` (`@stellar-did-credit/cli`): added `recency-decay` command to view recency decay configuration (`enabled`, `decay_bps_per_day`, `min_recency_bps`) from the credit-oracle with formatted table output and `--json` support (#948)
@@ -23,6 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- SDK: restore the missing `IssuerTier` result type used by `listIssuerTiers` (#1071).
+- CLI: restore missing issuer-tier formatting helpers for `get`, `list`, and `set` commands (#1071).
 - `packages/cli` (`@stellar-did-credit/cli`): handle unscored subjects in `get-score` command by printing a helpful message and outputting `{ "score": null }` in JSON mode (#700)
 - TypeScript SDK (`@stellar-did-credit/sdk`): `anchorDID`, `issueVC`,
   `revokeVC`, and `computeScore` now retry transient transaction submissions

@@ -129,6 +129,13 @@ impl RevocationRegistry {
         Ok(())
     }
 
+    pub fn is_paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&RevocationKey::Paused)
+            .unwrap_or(false)
+    }
+
     pub fn get_batch_limit(env: Env) -> u32 {
         env.storage()
             .instance()
@@ -718,16 +725,21 @@ mod tests {
         let contract_id = env.register_contract(None, RevocationRegistry);
         let client = RevocationRegistryClient::new(&env, &contract_id);
 
+        assert!(!client.is_paused());
+
         let admin = Address::generate(&env);
         client.initialize(&admin);
+        assert!(!client.is_paused());
 
         client.pause();
+        assert!(client.is_paused());
         assert_eq!(
             client.try_set_batch_limit(&admin, &10),
             Err(Ok(RevocationRegistryError::ContractPaused))
         );
 
         client.unpause();
+        assert!(!client.is_paused());
         assert!(client.try_set_batch_limit(&admin, &10).is_ok());
     }
 

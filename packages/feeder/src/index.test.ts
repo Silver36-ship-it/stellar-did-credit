@@ -369,6 +369,99 @@ describe("Horizon rate limiting handling", () => {
 
     consoleWarn.mockRestore();
   });
+
+  describe("edge cases", () => {
+    const subject = "GBAD5234567234567234567234567234567234567234567234567233";
+    let consoleWarn: jest.SpyInstance;
+    let setTimeoutSpy: jest.SpyInstance;
+    let sleepDelays: number[];
+
+    // Run sleep() callbacks immediately and record the requested delays.
+    beforeEach(() => {
+      consoleWarn = jest.spyOn(console, "warn").mockImplementation(() => {});
+      sleepDelays = [];
+      setTimeoutSpy = jest.spyOn(global, "setTimeout").mockImplementation(((
+        cb: () => void,
+        ms?: number,
+      ) => {
+        sleepDelays.push(ms ?? 0);
+        cb();
+        return 0 as unknown as NodeJS.Timeout;
+      }) as unknown as typeof setTimeout);
+    });
+
+    afterEach(() => {
+      consoleWarn.mockRestore();
+      setTimeoutSpy.mockRestore();
+    });
+
+    function rateLimitError(headers: Map<string, string>): any {
+      const err: any = new Error("429 Too Many Requests");
+      err.response = { status: 429, headers };
+      return err;
+    }
+
+    it("429 without Retry-After header uses exponential backoff", async () => {
+      // Pin jitter factor (0.5 + random) to exactly 1.
+      const randomSpy = jest.spyOn(Math, "random").mockReturnValue(0.5);
+
+      mockHorizonPaymentsCall
+        .mockImplementationOnce(() => Promise.reject(rateLimitError(new Map())))
+        .mockImplementationOnce(() => Promise.reject(rateLimitError(new Map())))
+        .mockImplementationOnce(() => Promise.resolve({ records: [] }));
+
+      const { fetchHorizonStats } = await import("./index");
+      const stats = await fetchHorizonStats("https://horizon.example", subject, {
+        maxRetries: 3,
+        retryBaseDelayMs: 10,
+      });
+
+      expect(stats.txCount30d).toBe(0);
+      expect(mockHorizonPaymentsCall).toHaveBeenCalledTimes(3);
+      expect(sleepDelays).toEqual([10, 20]);
+      expect(consoleWarn).toHaveBeenCalledTimes(2);
+      randomSpy.mockRestore();
+    });
+
+    it("429 with Retry-After=0 waits the 500ms floor and then succeeds", async () => {
+      mockHorizonPaymentsCall
+        .mockImplementationOnce(() =>
+          Promise.reject(rateLimitError(new Map([["retry-after", "0"]]))),
+        )
+        .mockImplementationOnce(() => Promise.resolve({ records: [] }));
+
+      const { fetchHorizonStats } = await import("./index");
+      const stats = await fetchHorizonStats("https://horizon.example", subject, {
+        maxRetries: 3,
+        retryBaseDelayMs: 10,
+      });
+
+      expect(stats.txCount30d).toBe(0);
+      expect(mockHorizonPaymentsCall).toHaveBeenCalledTimes(2);
+      expect(sleepDelays).toEqual([500]);
+    });
+
+    it("throws HorizonRateLimitError once max retries are exhausted", async () => {
+      mockHorizonPaymentsCall.mockImplementation(() =>
+        Promise.reject(rateLimitError(new Map([["retry-after", "1"]]))),
+      );
+
+      const { fetchHorizonStats } = await import("./index");
+      await expect(
+        fetchHorizonStats("https://horizon.example", subject, {
+          maxRetries: 2,
+          retryBaseDelayMs: 10,
+        }),
+      ).rejects.toMatchObject({
+        name: "HorizonRateLimitError",
+        message: "Horizon rate limit persisted after 2 retries",
+      });
+
+      // Initial attempt + 2 retries, each retry honouring Retry-After=1s.
+      expect(mockHorizonPaymentsCall).toHaveBeenCalledTimes(3);
+      expect(sleepDelays).toEqual([1000, 1000]);
+    });
+  });
 });
 
 
@@ -1394,6 +1487,389 @@ describe("fetchHorizonStats — mixed operation types", () => {
 
 
 // ---------------------------------------------------------------------------
+// fetchHorizonStats — per-operation-type coverage (issue #988)
+//
+// Each of the five operation types fetchHorizonStats understands is exercised
+// in isolation so volume, tx_count and counterparties are pinned down per type
+// rather than only in aggregate.
+// ---------------------------------------------------------------------------
+
+describe("fetchHorizonStats — operation type coverage (#988)", () => {
+  const SUBJECT = "GSUBJAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+  const OTHER_A = "GOTHAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+  const OTHER_B = "GOTHBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+  const NEW_ACCOUNT = "GNEWAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+  const NOW_ISO = new Date(Date.now() - 60_000).toISOString();
+
+  /** Wraps records in a single Horizon page whose next() is an empty page. */
+  function pageOf(records: any[]): any {
+    return { records, next: jest.fn().mockResolvedValue({ records: [] }) };
+  }
+
+  // -- payment ------------------------------------------------------------
+
+  it("payment: counts native XLM volume in both directions and tx_count", async () => {
+    const { fetchHorizonStats } = await import("./index");
+
+    mockHorizonPaymentsCall.mockResolvedValueOnce(
+      pageOf([
+        {
+          type: "payment",
+          transaction_hash: "tx-pay-in",
+          created_at: NOW_ISO,
+          from: OTHER_A,
+          to: SUBJECT,
+          asset_type: "native",
+          amount: "2.5000000",
+        },
+        {
+          type: "payment",
+          transaction_hash: "tx-pay-out",
+          created_at: NOW_ISO,
+          from: SUBJECT,
+          to: OTHER_B,
+          asset_type: "native",
+          amount: "1.5000000",
+        },
+      ]),
+    );
+
+    const stats = await fetchHorizonStats("https://horizon.example", SUBJECT);
+
+    // 2.5 XLM received + 1.5 XLM sent = 4 XLM = 40_000_000 stroops
+    expect(stats.volume30d).toBe(BigInt(40_000_000));
+    expect(stats.txCount30d).toBe(2);
+    // One counterparty per transaction.
+    expect(stats.avgCounterparties).toBe(1);
+  });
+
+  it("payment: excludes non-native amounts from volume but still counts the tx", async () => {
+    const { fetchHorizonStats } = await import("./index");
+
+    mockHorizonPaymentsCall.mockResolvedValueOnce(
+      pageOf([
+        {
+          type: "payment",
+          transaction_hash: "tx-pay-usdc",
+          created_at: NOW_ISO,
+          from: OTHER_A,
+          to: SUBJECT,
+          asset_type: "credit_alphanum4",
+          asset_code: "USDC",
+          amount: "999.0000000",
+        },
+      ]),
+    );
+
+    const stats = await fetchHorizonStats("https://horizon.example", SUBJECT);
+
+    expect(stats.volume30d).toBe(BigInt(0));
+    expect(stats.txCount30d).toBe(1);
+    // The other party is still tracked even though the asset is not XLM.
+    expect(stats.avgCounterparties).toBe(1);
+  });
+
+  it("payment: dedupes distinct counterparties within a single transaction", async () => {
+    const { fetchHorizonStats } = await import("./index");
+
+    mockHorizonPaymentsCall.mockResolvedValueOnce(
+      pageOf([
+        {
+          type: "payment",
+          transaction_hash: "tx-shared",
+          created_at: NOW_ISO,
+          from: OTHER_A,
+          to: SUBJECT,
+          asset_type: "native",
+          amount: "1.0000000",
+        },
+        {
+          type: "payment",
+          transaction_hash: "tx-shared",
+          created_at: NOW_ISO,
+          from: SUBJECT,
+          to: OTHER_B,
+          asset_type: "native",
+          amount: "1.0000000",
+        },
+      ]),
+    );
+
+    const stats = await fetchHorizonStats("https://horizon.example", SUBJECT);
+
+    // Both legs share one transaction hash, so they count as one tx.
+    expect(stats.txCount30d).toBe(1);
+    expect(stats.volume30d).toBe(BigInt(20_000_000));
+    // OTHER_A and OTHER_B are two distinct counterparties on that one tx.
+    expect(stats.avgCounterparties).toBe(2);
+  });
+
+  // -- path_payment_strict_send ------------------------------------------
+
+  it("path_payment_strict_send: counts the native source leg, ignores the non-native destination", async () => {
+    const { fetchHorizonStats } = await import("./index");
+
+    mockHorizonPaymentsCall.mockResolvedValueOnce(
+      pageOf([
+        {
+          type: "path_payment_strict_send",
+          transaction_hash: "tx-pps-native",
+          created_at: NOW_ISO,
+          from: SUBJECT,
+          to: OTHER_A,
+          // Sender spends 5 XLM...
+          source_asset_type: "native",
+          source_amount: "5.0000000",
+          // ...and the recipient receives a non-native asset.
+          asset_type: "credit_alphanum4",
+          amount: "200.0000000",
+        },
+        {
+          type: "path_payment_strict_send",
+          transaction_hash: "tx-pps-nonnative",
+          created_at: NOW_ISO,
+          from: SUBJECT,
+          to: OTHER_B,
+          // Non-native source leg must not contribute volume.
+          source_asset_type: "credit_alphanum4",
+          source_amount: "999.0000000",
+          asset_type: "native",
+          amount: "12.0000000",
+        },
+      ]),
+    );
+
+    const stats = await fetchHorizonStats("https://horizon.example", SUBJECT);
+
+    // Only the 5 XLM native source leg counts.
+    expect(stats.volume30d).toBe(BigInt(50_000_000));
+    expect(stats.txCount30d).toBe(2);
+    expect(stats.avgCounterparties).toBe(1);
+  });
+
+  // -- path_payment_strict_receive ---------------------------------------
+
+  it("path_payment_strict_receive: counts the native destination leg, ignores the non-native source", async () => {
+    const { fetchHorizonStats } = await import("./index");
+
+    mockHorizonPaymentsCall.mockResolvedValueOnce(
+      pageOf([
+        {
+          type: "path_payment_strict_receive",
+          transaction_hash: "tx-ppr-native",
+          created_at: NOW_ISO,
+          from: OTHER_A,
+          to: SUBJECT,
+          // Sender spends a non-native asset...
+          source_asset_type: "credit_alphanum4",
+          source_amount: "50.0000000",
+          // ...and SUBJECT receives 10 XLM.
+          asset_type: "native",
+          amount: "10.0000000",
+        },
+        {
+          type: "path_payment_strict_receive",
+          transaction_hash: "tx-ppr-nonnative",
+          created_at: NOW_ISO,
+          from: OTHER_B,
+          to: SUBJECT,
+          // Native source leg must not count when the subject is the recipient.
+          source_asset_type: "native",
+          source_amount: "7.0000000",
+          asset_type: "credit_alphanum4",
+          amount: "300.0000000",
+        },
+      ]),
+    );
+
+    const stats = await fetchHorizonStats("https://horizon.example", SUBJECT);
+
+    // Only the 10 XLM native destination leg counts.
+    expect(stats.volume30d).toBe(BigInt(100_000_000));
+    expect(stats.txCount30d).toBe(2);
+    expect(stats.avgCounterparties).toBe(1);
+  });
+
+  it("path payments: counts the send leg and the receive leg independently", async () => {
+    const { fetchHorizonStats } = await import("./index");
+
+    mockHorizonPaymentsCall.mockResolvedValueOnce(
+      pageOf([
+        // SUBJECT spends 4 XLM through a strict-send path payment.
+        {
+          type: "path_payment_strict_send",
+          transaction_hash: "tx-leg-send",
+          created_at: NOW_ISO,
+          from: SUBJECT,
+          to: OTHER_A,
+          source_asset_type: "native",
+          source_amount: "4.0000000",
+          asset_type: "credit_alphanum4",
+          amount: "80.0000000",
+        },
+        // SUBJECT receives 6 XLM through a strict-receive path payment.
+        {
+          type: "path_payment_strict_receive",
+          transaction_hash: "tx-leg-receive",
+          created_at: NOW_ISO,
+          from: OTHER_B,
+          to: SUBJECT,
+          source_asset_type: "credit_alphanum4",
+          source_amount: "60.0000000",
+          asset_type: "native",
+          amount: "6.0000000",
+        },
+      ]),
+    );
+
+    const stats = await fetchHorizonStats("https://horizon.example", SUBJECT);
+
+    // 4 XLM out + 6 XLM in = 10 XLM = 100_000_000 stroops
+    expect(stats.volume30d).toBe(BigInt(100_000_000));
+    expect(stats.txCount30d).toBe(2);
+    expect(stats.avgCounterparties).toBe(1);
+  });
+
+  // -- create_account -----------------------------------------------------
+
+  it("create_account: counts the tx and the counterparty without adding volume (subject funds)", async () => {
+    const { fetchHorizonStats } = await import("./index");
+
+    mockHorizonPaymentsCall.mockResolvedValueOnce(
+      pageOf([
+        {
+          type: "create_account",
+          transaction_hash: "tx-create-funded",
+          created_at: NOW_ISO,
+          funder: SUBJECT,
+          account: NEW_ACCOUNT,
+          starting_balance: "1.5000000",
+        },
+      ]),
+    );
+
+    const stats = await fetchHorizonStats("https://horizon.example", SUBJECT);
+
+    // starting_balance is locked in the new account, not a payment flow.
+    expect(stats.volume30d).toBe(BigInt(0));
+    expect(stats.txCount30d).toBe(1);
+    // The new account is the counterparty.
+    expect(stats.avgCounterparties).toBe(1);
+  });
+
+  it("create_account: tracks the funder as counterparty when the subject is the new account", async () => {
+    const { fetchHorizonStats } = await import("./index");
+
+    mockHorizonPaymentsCall.mockResolvedValueOnce(
+      pageOf([
+        {
+          type: "create_account",
+          transaction_hash: "tx-create-received",
+          created_at: NOW_ISO,
+          funder: OTHER_A,
+          account: SUBJECT,
+          starting_balance: "2.0000000",
+        },
+      ]),
+    );
+
+    const stats = await fetchHorizonStats("https://horizon.example", SUBJECT);
+
+    expect(stats.volume30d).toBe(BigInt(0));
+    expect(stats.txCount30d).toBe(1);
+    // The funder is the counterparty.
+    expect(stats.avgCounterparties).toBe(1);
+  });
+
+  // -- claim_claimable_balance -------------------------------------------
+
+  it("claim_claimable_balance: counts the tx only, with no volume and no self counterparty", async () => {
+    const { fetchHorizonStats } = await import("./index");
+
+    mockHorizonPaymentsCall.mockResolvedValueOnce(
+      pageOf([
+        {
+          type: "claim_claimable_balance",
+          transaction_hash: "tx-claim",
+          created_at: NOW_ISO,
+          claimant: SUBJECT,
+        },
+      ]),
+    );
+
+    const stats = await fetchHorizonStats("https://horizon.example", SUBJECT);
+
+    expect(stats.volume30d).toBe(BigInt(0));
+    expect(stats.txCount30d).toBe(1);
+    // The claimant is the subject itself, so it is not a counterparty.
+    expect(stats.avgCounterparties).toBe(0);
+  });
+
+  it("aggregates all five operation types in one page", async () => {
+    const { fetchHorizonStats } = await import("./index");
+
+    mockHorizonPaymentsCall.mockResolvedValueOnce(
+      pageOf([
+        {
+          type: "payment",
+          transaction_hash: "agg-tx1",
+          created_at: NOW_ISO,
+          from: OTHER_A,
+          to: SUBJECT,
+          asset_type: "native",
+          amount: "2.0000000",
+        },
+        {
+          type: "path_payment_strict_send",
+          transaction_hash: "agg-tx2",
+          created_at: NOW_ISO,
+          from: SUBJECT,
+          to: OTHER_B,
+          source_asset_type: "native",
+          source_amount: "3.0000000",
+          asset_type: "credit_alphanum4",
+          amount: "120.0000000",
+        },
+        {
+          type: "path_payment_strict_receive",
+          transaction_hash: "agg-tx3",
+          created_at: NOW_ISO,
+          from: OTHER_A,
+          to: SUBJECT,
+          source_asset_type: "credit_alphanum4",
+          source_amount: "40.0000000",
+          asset_type: "native",
+          amount: "4.0000000",
+        },
+        {
+          type: "create_account",
+          transaction_hash: "agg-tx4",
+          created_at: NOW_ISO,
+          funder: SUBJECT,
+          account: NEW_ACCOUNT,
+          starting_balance: "1.0000000",
+        },
+        {
+          type: "claim_claimable_balance",
+          transaction_hash: "agg-tx5",
+          created_at: NOW_ISO,
+          claimant: SUBJECT,
+        },
+      ]),
+    );
+
+    const stats = await fetchHorizonStats("https://horizon.example", SUBJECT);
+
+    // 2 (payment) + 3 (strict-send source) + 4 (strict-receive dest) = 9 XLM
+    expect(stats.volume30d).toBe(BigInt(90_000_000));
+    expect(stats.txCount30d).toBe(5);
+    // counterparties: tx1→1, tx2→1, tx3→1, tx4→1, tx5→0 = 4 / 5 txns
+    expect(stats.avgCounterparties).toBe(1);
+  });
+});
+
+
+// ---------------------------------------------------------------------------
 // Issue #518: a transient failure mid-pagination must not discard the subject
 // ---------------------------------------------------------------------------
 
@@ -1748,5 +2224,47 @@ describe("Feeder governanceId validation (#954)", () => {
           { publicKey: () => "GFEEDER" } as any,
         ),
     ).toThrow(/must start with 'C' and be 56 characters/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #930: revocationRegistryId config validation
+// ---------------------------------------------------------------------------
+
+describe("Feeder config: revocationRegistryId validation", () => {
+  const baseConfig: FeederConfig = { ...config };
+  const keypair = { publicKey: () => "GAAAA" } as unknown as Keypair;
+
+  it("throws when revocationRegistryId is not a valid C-address", () => {
+    expect(() => new Feeder({ ...baseConfig, revocationRegistryId: "not-a-contract" }, keypair)).toThrow(
+      /revocationRegistryId must be a valid Soroban contract ID \(C-address\)/,
+    );
+  });
+
+  it("throws when revocationRegistryId is a G-address", () => {
+    expect(
+      () =>
+        new Feeder(
+          { ...baseConfig, revocationRegistryId: "GBUQWP3BOUZX34ULNQG23RQ6F4YUSXHTQSXE7XDZT4A65XJLQRGEZSM" },
+          keypair,
+        ),
+    ).toThrow(/revocationRegistryId must be a valid Soroban contract ID/);
+  });
+
+  it("accepts a valid C-address", () => {
+    expect(
+      () =>
+        new Feeder(
+          {
+            ...baseConfig,
+            revocationRegistryId: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+          },
+          keypair,
+        ),
+    ).not.toThrow();
+  });
+
+  it("accepts an omitted revocationRegistryId (optional field)", () => {
+    expect(() => new Feeder(baseConfig, keypair)).not.toThrow();
   });
 });

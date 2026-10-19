@@ -28,10 +28,11 @@ import {
   type DisputeRecord,
   type VCRecord,
   type ScoringWeights,
-  type RepaymentRecord,
   type TxStats,
   type RecencyDecayConfig,
   type CredentialTypeWeight,
+  type IssuerTier,
+  type ProtocolConfig,
 } from "@stellar-did-credit/sdk";
 import { loadConfig, validateConfig, type NetworkType } from "./config";
 import { readBatchCsv, writeBatchResults, type BatchResult } from "./batch";
@@ -98,6 +99,21 @@ function parseVcHash(hex: string): Buffer {
       "Error: vc-hash must be a 64-character hex string (32 bytes).",
     );
     process.exit(1);
+  }
+  return Buffer.from(hex, "hex");
+}
+
+/**
+ * Parses a hex-encoded WASM hash (as printed by `stellar contract upload`)
+ * into a 32-byte Buffer, or returns undefined after reporting the error.
+ */
+function parseWasmHash(hex: string): Buffer | undefined {
+  if (hex.length !== 64 || !/^[0-9a-fA-F]{64}$/.test(hex)) {
+    console.error(
+      "Error: wasm-hash must be a 64-character hex string (32 bytes).",
+    );
+    process.exit(1);
+    return undefined;
   }
   return Buffer.from(hex, "hex");
 }
@@ -400,6 +416,36 @@ function printCredentialTypeWeights(
     console.log(`│ ${typeCol} │ ${weightCol} │ ${multCol} │`);
   }
   console.log("└───────────────────────┴──────────────┴────────────┘");
+  console.log();
+}
+
+function formatIssuerTierMultiplier(bps: number): string {
+  return `${bps} bps = ${(bps / 100).toFixed(2)}x`;
+}
+
+function printIssuerTier(issuer: string, bps: number): void {
+  console.log();
+  console.log(`  Issuer:     ${issuer}`);
+  console.log(`  Tier (bps): ${bps}`);
+  console.log(`  Multiplier: ${formatIssuerTierMultiplier(bps)}`);
+  console.log();
+}
+
+function printIssuerTiers(tiers: IssuerTier[]): void {
+  if (tiers.length === 0) {
+    console.log("No issuers registered.");
+    return;
+  }
+
+  console.log();
+  console.log(
+    "Issuer                                                   │ Tier (bps) │ Multiplier",
+  );
+  for (const tier of tiers) {
+    console.log(
+      `${tier.issuer.padEnd(56)} │ ${String(tier.bps).padStart(10)} │ ${formatIssuerTierMultiplier(tier.bps)}`,
+    );
+  }
   console.log();
 }
 
@@ -798,6 +844,76 @@ program
       process.exit(1);
     }
   });
+
+// ---------------------------------------------------------------------------
+// Command group: revocation
+// ---------------------------------------------------------------------------
+
+const revocation = program
+  .command("revocation")
+  .description("Check revocation status and list revoked credentials.");
+
+revocation
+  .command("check")
+  .description("Check whether a credential has been revoked.")
+  .argument("<vc-hash>", "SHA-256 credential hash (64 hex characters)")
+  .option("--json", "Output as JSON")
+  .action(async (hash: string, cmdOptions: { json?: boolean }) => {
+    const config = loadConfig(program.opts().network as NetworkType);
+    validateConfig(config, ["revocationRegistryId"], true);
+    const parsed = parseVcHash(hash);
+    if (!parsed) return;
+    try {
+      const revoked = await new StellarDIDCreditSDK(config).isRevoked(parsed);
+      if (cmdOptions.json) console.log(JSON.stringify({ vcHash: hash.toLowerCase(), revoked }));
+      else console.log(revoked ? "Credential is revoked." : "Credential is not revoked.");
+    } catch (err) { console.error("Failed:", err instanceof Error ? err.message : err); process.exit(1); }
+  });
+
+revocation
+  .command("record")
+  .description("Get the issuer that revoked a credential.")
+  .argument("<vc-hash>", "SHA-256 credential hash (64 hex characters)")
+  .option("--json", "Output as JSON")
+  .action(async (hash: string, cmdOptions: { json?: boolean }) => {
+    const config = loadConfig(program.opts().network as NetworkType);
+    validateConfig(config, ["revocationRegistryId"], true);
+    const parsed = parseVcHash(hash);
+    if (!parsed) return;
+    try {
+      const issuer = await new StellarDIDCreditSDK(config).getRevocationRecord(parsed);
+      if (cmdOptions.json) console.log(JSON.stringify({ vcHash: hash.toLowerCase(), issuer }));
+      else console.log(issuer ? `Revoking issuer: ${issuer}` : "Credential has no revocation record.");
+    } catch (err) { console.error("Failed:", err instanceof Error ? err.message : err); process.exit(1); }
+  });
+
+for (const action of ["count", "list"] as const) {
+  revocation
+    .command(action)
+    .description(action === "count" ? "Get the number of credentials revoked by an issuer." : "List credential hashes revoked by an issuer.")
+    .argument("<issuer-address>", "Stellar G... address of the issuer")
+    .option("--json", "Output as JSON")
+    .action(async (issuer: string, cmdOptions: { json?: boolean }) => {
+      const config = loadConfig(program.opts().network as NetworkType);
+      validateConfig(config, ["revocationRegistryId"], true);
+      const upperIssuer = issuer.toUpperCase();
+      assertStellarAddress("issuer-address", upperIssuer);
+      try {
+        const sdk = new StellarDIDCreditSDK(config);
+        if (action === "count") {
+          const count = await sdk.getRevocationCount(upperIssuer);
+          if (cmdOptions.json) console.log(JSON.stringify({ issuer: upperIssuer, count }));
+          else console.log(`Revocation count: ${count}`);
+        } else {
+          const hashes = await sdk.listRevokedByIssuer(upperIssuer);
+          const vcHashes = hashes.map((value) => value.toString("hex"));
+          if (cmdOptions.json) console.log(JSON.stringify({ issuer: upperIssuer, vcHashes }));
+          else if (vcHashes.length === 0) console.log("No revoked credentials found.");
+          else for (const hash of vcHashes) console.log(hash);
+        }
+      } catch (err) { console.error("Failed:", err instanceof Error ? err.message : err); process.exit(1); }
+    });
+}
 
 // ---------------------------------------------------------------------------
 // Command group: disputes
@@ -1733,79 +1849,6 @@ Example:
   });
 
 // ---------------------------------------------------------------------------
-// Command: repayment
-// ---------------------------------------------------------------------------
-
-program
-  .command("repayment")
-  .description(
-    "Fetch the on-chain repayment history for a subject address from the credit-oracle.",
-  )
-  .argument("<subject-address>", "Stellar G... address of the subject")
-  .option("--json", "Output the full RepaymentRecord as JSON")
-  .action(async (subjectAddress: string, cmdOptions: { json?: boolean }) => {
-    const globalOptions = program.opts();
-    const network = globalOptions.network as NetworkType;
-    const config = loadConfig(network);
-    validateConfig(config, ['creditOracleId'], true);
-    const upperAddr = subjectAddress.toUpperCase();
-    assertStellarAddress("subject-address", upperAddr);
-
-    const sdk = new StellarDIDCreditSDK(config);
-
-    if (!cmdOptions.json) {
-      console.log(`Fetching repayment history for ${upperAddr} on ${network}...`);
-    }
-
-    try {
-      const record = await sdk.getRepaymentRecord(upperAddr);
-
-      if (record === null) {
-        if (cmdOptions.json) {
-          console.log(JSON.stringify({ repayment: null }));
-        } else {
-          console.log();
-          console.log(
-            "No repayment history found for this subject.",
-          );
-        }
-        process.exit(0);
-        return;
-      }
-
-      const repaymentRate =
-        record.totalCount > 0
-          ? Math.round((record.onTimeCount / record.totalCount) * 10_000)
-          : 0;
-
-      if (cmdOptions.json) {
-        console.log(
-          JSON.stringify(
-            {
-              onTimeCount: record.onTimeCount,
-              totalCount: record.totalCount,
-              totalRepaid: record.totalRepaid.toString(),
-              repaymentRateBps: repaymentRate,
-            },
-            null,
-            2,
-          ),
-        );
-        process.exit(0);
-        return;
-      } else {
-        printRepaymentRecord(record);
-      }
-    } catch (err) {
-      console.error(
-        "Failed:",
-        err instanceof Error ? err.message : err,
-      );
-      process.exit(1);
-    }
-  });
-
-// ---------------------------------------------------------------------------
 // Command: batch-anchor-vc
 // ---------------------------------------------------------------------------
 
@@ -2383,6 +2426,120 @@ for (const action of ["pause", "unpause"] as const) {
         }
       });
   }
+}
+
+// ---------------------------------------------------------------------------
+// Command group: upgrade
+// ---------------------------------------------------------------------------
+
+async function runUpgradeCommand(params: {
+  target: "identity" | "credit" | "revocation";
+  adminSecret: string;
+  wasmHashHex: string;
+  dryRun?: boolean;
+}): Promise<void> {
+  const { target, adminSecret, wasmHashHex } = params;
+  const network = program.opts().network as NetworkType;
+  const config = loadConfig(network);
+  const targetConfig: {
+    configKey: keyof ProtocolConfig;
+    contractName: string;
+  } = {
+    identity: { configKey: "identityOracleId", contractName: "identity-oracle" },
+    credit: { configKey: "creditOracleId", contractName: "credit-oracle" },
+    revocation: { configKey: "revocationRegistryId", contractName: "revocation-registry" },
+  }[target];
+  validateConfig(config, [targetConfig.configKey]);
+
+  const contractId = config[targetConfig.configKey]!;
+  const keypair = parseSecret(adminSecret);
+  const wasmHash = parseWasmHash(wasmHashHex);
+  if (!wasmHash) {
+    return;
+  }
+  if (params.dryRun) {
+    const contract = new Contract(contractId);
+    const hashScVal = nativeToScVal(new Uint8Array(wasmHash), {
+      type: "bytes",
+    });
+    // credit-oracle takes the admin address explicitly; the other two verify
+    // the stored admin through require_admin() and take only the hash.
+    const operation = contract.call(
+      "upgrade",
+      ...(target === "credit"
+        ? [new Address(keypair.publicKey()).toScVal(), hashScVal]
+        : [hashScVal]),
+    );
+    await simulateDryRun({
+      rpcUrl: config.rpcUrl,
+      networkPassphrase: config.networkPassphrase,
+      sourceKeypair: keypair,
+      contractId,
+      operation,
+      label: `upgrade ${targetConfig.contractName}`,
+    });
+    return;
+  }
+
+  const sdk = new StellarDIDCreditSDK(config);
+  let txHash: string;
+  if (target === "identity") {
+    txHash = await sdk.upgradeIdentityOracle(keypair, wasmHash);
+  } else if (target === "credit") {
+    txHash = await sdk.upgradeCreditOracle(keypair, wasmHash);
+  } else {
+    txHash = await sdk.upgradeRevocationRegistry(keypair, wasmHash);
+  }
+
+  console.log(`Upgrading ${targetConfig.contractName} on ${network}...`);
+  console.log(`  Admin:     ${keypair.publicKey()}`);
+  console.log(`  WASM Hash: ${wasmHashHex.toLowerCase()}`);
+  console.log();
+  console.log("Success!");
+  console.log(`  Transaction: ${txHash}`);
+}
+
+const upgrade = program
+  .command("upgrade")
+  .description(
+    "Upgrade contract WASM bytecode in-place, preserving the contract address " +
+      "and all stored state (admin only). Upgrades are irreversible once " +
+      "confirmed on-chain.",
+  );
+
+for (const target of ["identity", "credit", "revocation"] as const) {
+  upgrade
+    .command(target)
+    .description(`Upgrade the ${target} contract (admin only).`)
+    .argument("<admin-secret>", "Stellar secret key of the contract admin (starts with S)")
+    .argument("<wasm-hash>", "SHA-256 hash of the new WASM bytecode (64 hex characters)")
+    .option("--dry-run", "Simulate transaction execution without broadcasting")
+    .addHelpText(
+      "after",
+      `
+Example:
+  $ stellar-did upgrade ${target} S... 5c4146...
+`
+    )
+    .action(
+      async (
+        adminSecret: string,
+        wasmHash: string,
+        cmdOptions: { dryRun?: boolean },
+      ) => {
+        try {
+          await runUpgradeCommand({
+            target,
+            adminSecret,
+            wasmHashHex: wasmHash,
+            dryRun: cmdOptions.dryRun,
+          });
+        } catch (err) {
+          console.error("Failed:", err instanceof Error ? err.message : err);
+          process.exit(1);
+        }
+      },
+    );
 }
 
 // ---------------------------------------------------------------------------
